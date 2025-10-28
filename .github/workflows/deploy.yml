@@ -8,6 +8,9 @@ on:
       - 'v*.*.*'  # deploys to production when tag pushed
 
 jobs:
+  # ----------------------------------------
+  # 🧪 BUILD SPRING BOOT JAR
+  # ----------------------------------------
   build:
     runs-on: ubuntu-latest
     steps:
@@ -26,12 +29,15 @@ jobs:
           chmod +x mvnw
           ./mvnw clean package -DskipTests
 
-      - name: Upload build artifact (for reuse in next jobs)
+      - name: Upload JAR artifact
         uses: actions/upload-artifact@v4
         with:
           name: springboot-jar
           path: test/target/*.jar
 
+  # ----------------------------------------
+  # 🐳 BUILD & PUSH DOCKER IMAGE
+  # ----------------------------------------
   build-and-push:
     needs: build
     runs-on: ubuntu-latest
@@ -39,13 +45,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download built JAR
+      - name: Download JAR artifact
         uses: actions/download-artifact@v4
         with:
           name: springboot-jar
-          path: target/
+          path: test/target/
 
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -56,25 +62,28 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build & Push Docker Image to ECR
+      - name: Build & Push Docker image
         run: |
           IMAGE_TAG=${{ github.sha }}
           if [[ "${{ github.ref }}" =~ ^refs/tags/v ]]; then
             IMAGE_TAG="${GITHUB_REF#refs/tags/}"
           fi
+          echo "Building image tag: $IMAGE_TAG"
 
-          docker build -f Dockerfile -t ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG .
+          docker build -t ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG .
           docker push ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG
 
-        env:
-          IMAGE_TAG: ${{ github.sha }}
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
 
+  # ----------------------------------------
+  # 🚀 DEPLOY TO STAGING (develop)
+  # ----------------------------------------
   deploy-staging:
     needs: build-and-push
     if: github.ref == 'refs/heads/develop'
     runs-on: ubuntu-latest
     steps:
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -84,14 +93,14 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Update ECS Task Definition (staging)
+      - name: Deploy to ECS (staging)
         run: |
           TASK_DEF=$(aws ecs describe-task-definition \
             --task-definition ${{ vars.ECS_TASK_DEFINITION_STAGING }} \
             --region ${{ vars.AWS_REGION }})
 
           NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
-            --arg IMAGE "${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}" \
+            --arg IMAGE "${{ secrets.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}" \
             '.taskDefinition | .containerDefinitions[0].image = $IMAGE |
              del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
                  .compatibilities, .registeredAt, .registeredBy)')
@@ -114,12 +123,15 @@ jobs:
             --services ${{ vars.ECS_SERVICE_STAGING }} \
             --region ${{ vars.AWS_REGION }}
 
+  # ----------------------------------------
+  # 🚀 DEPLOY TO PRODUCTION (on tag push)
+  # ----------------------------------------
   deploy-production:
     needs: build-and-push
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -129,14 +141,14 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Update ECS Task Definition (production)
+      - name: Deploy to ECS (production)
         run: |
           TASK_DEF=$(aws ecs describe-task-definition \
             --task-definition ${{ vars.ECS_TASK_DEFINITION_PRODUCTION }} \
             --region ${{ vars.AWS_REGION }})
 
           NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
-            --arg IMAGE "${{ secrets.ECR_REPOSITORY }}:${{ github.ref_name }}" \
+            --arg IMAGE "${{ secrets.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}" \
             '.taskDefinition | .containerDefinitions[0].image = $IMAGE |
              del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
                  .compatibilities, .registeredAt, .registeredBy)')
